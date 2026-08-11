@@ -21,6 +21,8 @@ uv run pytest                        # 4. 테스트
 
 ```
 .
+├── Dockerfile           CPU 추론용 multi-stage image 정의
+├── .dockerignore        build context에서 개발 파일 제외
 ├── app/
 │   ├── __init__.py
 │   ├── config.py        설정 + 모델 구조 상수 (학습/서빙 공유)
@@ -143,7 +145,64 @@ epoch  300 | loss 0.0002 | acc 1.0000
 state_dict 저장 완료: .../models/model.pth
 ```
 
-## 7. curl 호출 예제
+## 7. Docker로 실행
+
+이 프로젝트는 **호스트에서 학습한 `models/model.pth`를 image build 시 포함**하는 방식을 사용합니다. 학습을 image build나 container 시작 과정에 넣지 않으므로, 같은 image는 항상 같은 가중치를 사용하며 시작 또는 요청마다 재학습하지 않습니다. `models/model.pth`는 Git에는 포함되지 않지만 `.dockerignore`가 이 파일 하나를 build context에 허용합니다.
+
+### 7.1 모델 준비와 image build
+
+저장소 루트에서 다음 순서로 실행합니다.
+
+```bash
+# 1. 로컬 의존성 설치와 모델 학습
+uv sync
+uv run python -m scripts.train
+
+# 2. 학습된 model.pth를 포함한 image build
+docker build -t pytorch-serving:local .
+```
+
+`models/model.pth`가 없으면 Dockerfile의 `COPY` 단계가 실패합니다. 이는 모델 없이 실행되는 image가 만들어지는 것을 막기 위한 의도적인 동작입니다.
+
+Dockerfile의 주요 단계와 이유는 다음과 같습니다.
+
+| 단계 | 이유 |
+| --- | --- |
+| `python:3.13-slim-bookworm` | 프로젝트의 Python 3.13과 맞추면서 기본 OS 크기를 줄입니다. |
+| 고정 버전의 `uv` build mount | 동일한 uv 버전으로 설치하되 uv 바이너리 자체는 최종 image layer에 남기지 않습니다. |
+| `pyproject.toml`, `uv.lock` 선복사 후 `uv sync --frozen --no-dev` | lock 파일을 변경하지 않고 운영 의존성만 설치하며, 앱 코드만 바뀐 build에서는 의존성 layer cache를 재사용합니다. 기존 CPU 전용 PyTorch index 설정도 이때 적용됩니다. |
+| BuildKit cache mount | uv 다운로드 cache를 image에서 제외하면서 재빌드에는 재사용합니다. 의존성을 최종 Python stage에 직접 설치해 큰 PyTorch 환경을 stage 사이에서 중복 복사하지 않습니다. |
+| `app/`, `models/model.pth` 후복사 | 코드나 모델 변경이 큰 의존성 설치 layer를 무효화하지 않게 합니다. |
+| non-root 사용자 | 서버 프로세스를 root 권한 없이 실행합니다. |
+| `HEALTHCHECK`, `CMD` | 기존 `/health`를 주기적으로 확인하고 Uvicorn을 `0.0.0.0:8000`에서 실행합니다. |
+
+### 7.2 Container 실행과 API 확인
+
+```bash
+# 백그라운드 실행 (호스트 8000 -> container 8000)
+docker run --rm --name pytorch-serving \
+  -d -p 8000:8000 \
+  pytorch-serving:local
+
+# Docker health check 상태 확인 (시작 직후에는 starting일 수 있음)
+docker inspect --format='{{.State.Health.Status}}' pytorch-serving
+
+# FastAPI health endpoint 확인
+curl -s http://127.0.0.1:8000/health
+# {"status":"ok","model_loaded":true,"device":"cpu"}
+
+# 모델 추론 확인
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"features": [-2.0, -1.0, -2.0, -1.0]}'
+
+# Container 종료 (--rm으로 실행했으므로 종료 후 자동 삭제)
+docker stop pytorch-serving
+```
+
+Container가 시작되면 Uvicorn이 `app.main:app`을 import하고 FastAPI lifespan이 `/app/models/model.pth`를 CPU로 한 번 로드합니다. 로딩이 성공한 뒤 요청을 받으며, 이후 `/predict` 요청들은 `app.state.predictor`의 같은 모델 인스턴스를 공유합니다.
+
+## 8. curl 호출 예제
 
 ```bash
 # 헬스 체크
@@ -176,7 +235,7 @@ curl -s -X POST http://127.0.0.1:8000/predict \
 | `warm` | `[0.0, 1.0, 0.0, 1.0]` |
 | `hot` | `[2.0, -1.0, 2.0, -1.0]` |
 
-## 8. 테스트
+## 9. 테스트
 
 ```bash
 uv run pytest          # 전체
